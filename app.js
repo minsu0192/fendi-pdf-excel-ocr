@@ -55,7 +55,12 @@ async function runExtraction() {
         const pct = Math.min(18, base + Math.round((m.progress || 0) * 15));
         setProgress(pct, 'OCR 준비', `${koreanStatus(m.status)} ${Math.round((m.progress || 0) * 100)}%`);
       },
-      langPath: 'https://tessdata.projectnaptha.com/4.0.0'
+      // Use the same current tessdata_fast models as the verified desktop build.
+      // The default Project Naptha models are older and were materially less
+      // accurate on this small Korean customs table.
+      langPath: 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main',
+      gzip: false,
+      cacheMethod: 'refresh'
     });
     await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK, preserve_interword_spaces: '1' });
     const allRows = [];
@@ -72,7 +77,23 @@ async function runExtraction() {
       setProgress(Math.round(from), `${pageNo}페이지 OCR`, `${i + 1}/${STATE.pages.length}페이지를 읽는 중입니다.`);
       const result = await worker.recognize(canvas, {}, { tsv: true });
       const words = FendiExtractor.parseTsv(result.data.tsv);
-      allRows.push(...FendiExtractor.extractRows(words, canvas.width, canvas.height, pageNo));
+      const pageRows = FendiExtractor.extractRows(words, canvas.width, canvas.height, pageNo);
+
+      // Re-read the two critical identifier columns from a narrow crop with an
+      // alphanumeric whitelist. Small declaration numbers are substantially
+      // more accurate this way than in whole-page mixed Korean OCR.
+      const keyCanvas = document.createElement('canvas');
+      const keyX = Math.floor(canvas.width * .125);
+      keyCanvas.width = Math.ceil(canvas.width * .110);
+      keyCanvas.height = canvas.height;
+      keyCanvas.getContext('2d').drawImage(canvas, keyX, 0, keyCanvas.width, canvas.height, 0, 0, keyCanvas.width, canvas.height);
+      await worker.setParameters({tessedit_char_whitelist:'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'});
+      const keyResult = await worker.recognize(keyCanvas, {}, {tsv:true});
+      await worker.setParameters({tessedit_char_whitelist:''});
+      const keyWords = FendiExtractor.parseTsv(keyResult.data.tsv, 0);
+      const keys = FendiExtractor.extractKeyFields(keyWords, keyCanvas.height);
+      FendiExtractor.applyKeyFields(pageRows, keys, canvas.height);
+      allRows.push(...pageRows);
     }
     if (allRows.length < Math.max(1, STATE.pages.length * 5)) throw new Error(`OCR 결과가 비정상적으로 적습니다(${allRows.length}행). 이 PDF가 FENDI 공문 양식인지 확인하세요.`);
     STATE.rows = allRows;
