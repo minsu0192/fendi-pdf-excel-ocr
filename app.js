@@ -48,11 +48,6 @@ async function runExtraction() {
       throw new Error(`페이지 범위는 1~${pdf.numPages} 사이로 입력하세요.`);
     }
     STATE.pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-    FendiExtractor.setFormDefaults({
-      owner: window.prompt('담당자명을 입력하세요. (입력한 값은 브라우저 밖으로 전송되지 않습니다.)', '') || '',
-      taxpayer: window.prompt('납세의무자(상호)를 입력하세요.', '') || '',
-      taxpayerId: window.prompt('납세의무자번호를 입력하세요. (숫자만)', '') || ''
-    });
     setProgress(3, 'OCR 준비', '한국어·영어 OCR 모델을 처음 한 번 내려받습니다.');
     worker = await Tesseract.createWorker(['kor', 'eng'], 1, {
       logger: m => {
@@ -98,11 +93,34 @@ async function runExtraction() {
       const keyWords = FendiExtractor.parseTsv(keyResult.data.tsv, 0);
       const keys = FendiExtractor.extractKeyFields(keyWords, keyCanvas.height);
       FendiExtractor.applyKeyFields(pageRows, keys, canvas.height);
+
+      // Re-read each variable column independently. Keeping the original Y
+      // coordinate lets us attach every result to its own row without copying
+      // a frequent value across unrelated records.
+      const columnJobs = [
+        {col:0, whitelist:''},
+        {col:3, whitelist:''},
+        {col:4, whitelist:'0123456789'},
+        {col:5, whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789&.,()-'},
+        {col:6, whitelist:'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-'},
+        {col:7, whitelist:''}
+      ];
+      for (let j = 0; j < columnJobs.length; j++) {
+        const job = columnJobs[j];
+        const x1 = Math.floor(canvas.width * (job.col === 0 ? .09 : FendiExtractor.X_BOUNDS[job.col]));
+        const x2 = Math.ceil(canvas.width * Math.min(1, FendiExtractor.X_BOUNDS[job.col + 1]));
+        const {canvas: colCanvas, centers} = buildColumnStrip(canvas, pageRows, x1, x2);
+        await worker.setParameters({tessedit_char_whitelist:job.whitelist});
+        setProgress(Math.round(from + (j + 1) * (12 / columnJobs.length)), `${pageNo}페이지 열 검증`, `${j + 1}/${columnJobs.length}개 열을 다시 읽는 중입니다.`);
+        const colResult = await worker.recognize(colCanvas, {}, {tsv:true});
+        FendiExtractor.applyColumnWords(pageRows, FendiExtractor.parseTsv(colResult.data.tsv, 0), colCanvas.height, job.col, centers);
+      }
+      await worker.setParameters({tessedit_char_whitelist:''});
       allRows.push(...pageRows);
     }
     if (allRows.length < Math.max(1, STATE.pages.length * 5)) throw new Error(`OCR 결과가 비정상적으로 적습니다(${allRows.length}행). 이 PDF가 FENDI 공문 양식인지 확인하세요.`);
-    STATE.rows = allRows;
-    setProgress(100, '완료', `${allRows.length}개 행을 추출했습니다.`);
+    STATE.rows = FendiExtractor.finalizeRows(allRows);
+    setProgress(100, '완료', `${STATE.rows.length}개 행을 추출했습니다.`);
     renderResults();
   } catch (err) {
     console.error(err); showError(err?.message || '처리 중 오류가 발생했습니다.');
@@ -110,6 +128,28 @@ async function runExtraction() {
     if (worker) await worker.terminate();
     UI.runButton.disabled = !STATE.file;
   }
+}
+
+function buildColumnStrip(source, rows, x1, x2) {
+  const scale = 2;
+  const half = Math.max(15, Math.floor(source.height * .0052));
+  const padding = 12;
+  const slotHeight = half * 2 * scale + padding * 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(80, (x2 - x1) * scale + padding * 2);
+  canvas.height = Math.max(slotHeight, rows.length * slotHeight);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = false;
+  const centers = [];
+  rows.forEach((row, i) => {
+    const top = Math.max(0, Math.round((row._y || 0) - half));
+    const sourceHeight = Math.min(half * 2, source.height - top);
+    const destY = i * slotHeight + padding;
+    ctx.drawImage(source, x1, top, x2 - x1, sourceHeight, padding, destY, (x2 - x1) * scale, sourceHeight * scale);
+    centers.push(destY + sourceHeight * scale / 2);
+  });
+  return {canvas, centers};
 }
 
 function preprocessCanvas(ctx, width, height) {
