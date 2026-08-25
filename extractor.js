@@ -240,10 +240,11 @@
   }
 
   function finalizeRows(rows) {
+    recoverDeclarationSuffix(rows);
     for (const page of new Set(rows.map(r => r[8]))) {
       const pageRows = rows.filter(r => r[8] === page);
-      applyLocalConsensus(pageRows, 0, 1);
-      applyLocalConsensus(pageRows, 3, 2);
+      applyLocalConsensus(pageRows, 0, 2);
+      applyLocalConsensus(pageRows, 3, 3);
       applyBusinessConsensus(pageRows);
     }
     for (const row of rows) {
@@ -260,23 +261,34 @@
 
   function applyLocalConsensus(rows, col, maxEdits) {
     const compact = value => String(value || '').replace(/[^0-9A-Za-z가-힣]/g, '').toUpperCase();
+    const displayScore = value => {
+      const text = cleanCell(value, col);
+      return (text.match(/[가-힣]/g) || []).length * 5 + (col === 3 && /\(주\)$/.test(text) ? 20 : 0) + text.length;
+    };
     const votes = new Map();
     for (const row of rows) {
       for (const value of [row[col], row._columnCandidates?.[col]?.value]) {
         const key = compact(value);
-        if (key.length >= 2) votes.set(key, {value: cleanCell(value, col), count: (votes.get(key)?.count || 0) + 1});
+        if (key.length >= 2) {
+          const previous = votes.get(key);
+          const cleaned = cleanCell(value, col);
+          votes.set(key, {value: !previous || displayScore(cleaned) > displayScore(previous.value) ? cleaned : previous.value, count: (previous?.count || 0) + 1});
+        }
       }
     }
     const winner = [...votes.values()].sort((a,b) => b.count - a.count)[0];
     if (!winner || winner.count < Math.max(5, rows.length * .35)) return;
     const winnerKey = compact(winner.value);
+    const strongWinner = winner.count >= Math.max(5, rows.length * .35);
     for (const row of rows) {
       const currentKey = compact(row[col]);
       const distance = editDistance(currentKey, winnerKey);
       const confidence = row._confidences?.[col] || 0;
+      const hasKorean = /[가-힣]{2,}/.test(String(row[col] || ''));
+      const clearlyBroken = !hasKorean || /(.)\1{2,}/.test(currentKey);
       if (currentKey === winnerKey && cleanCell(row[col], col) !== winner.value) {
         row[col] = winner.value;
-      } else if (currentKey !== winnerKey && distance <= maxEdits) {
+      } else if (currentKey !== winnerKey && (distance <= maxEdits || (strongWinner && clearlyBroken))) {
         row[col] = winner.value;
         if (row._confidences) row._confidences[col] = Math.max(confidence, 80);
       } else if (currentKey !== winnerKey && distance <= maxEdits + 2) {
@@ -287,16 +299,42 @@
   }
 
   function applyBusinessConsensus(rows) {
-    const valid = rows.map(r => String(r[4] || '')).filter(isValidBusinessNumber);
-    const counts = valid.reduce((m,v) => (m.set(v,(m.get(v)||0)+1),m), new Map());
-    const winner = [...counts.entries()].sort((a,b) => b[1]-a[1])[0];
-    if (!winner || winner[1] < Math.max(5, rows.length * .35)) return;
+    const companyKey = value => String(value || '').replace(/[^A-Za-z가-힣0-9]/g, '').toUpperCase();
+    const groups = new Map();
     for (const row of rows) {
-      const current = String(row[4] || '');
-      if (!isValidBusinessNumber(current) && editDistance(current, winner[0]) <= 2) {
-        row[4] = winner[0];
-        if (row._confidences) row._confidences[4] = Math.max(row._confidences[4] || 0, 80);
+      const key = companyKey(row[3]);
+      if (!key) continue;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+    for (const groupRows of groups.values()) {
+      const valid = groupRows.map(r => String(r[4] || '')).filter(isValidBusinessNumber);
+      const counts = valid.reduce((m,v) => (m.set(v,(m.get(v)||0)+1),m), new Map());
+      const winner = [...counts.entries()].sort((a,b) => b[1]-a[1])[0];
+      if (!winner || groupRows.length < 3 || winner[1] < Math.max(2, groupRows.length * .65)) continue;
+      for (const row of groupRows) {
+        const current = String(row[4] || '');
+        if (!isValidBusinessNumber(current)) {
+          row[4] = winner[0];
+          if (row._confidences) row._confidences[4] = Math.max(row._confidences[4] || 0, 80);
+        } else if (current !== winner[0] && winner[1] / groupRows.length >= .85) {
+          row._consensusReview = row._consensusReview || [];
+          row._consensusReview.push('상호-사업자번호 불일치');
+        }
       }
+    }
+  }
+
+  function recoverDeclarationSuffix(rows) {
+    const valid = rows.map(r => String(r[1] || '')).filter(v => /^\d{13}[A-Z]$/.test(v));
+    if (!valid.length) return;
+    const counts = valid.reduce((m,v) => (m.set(v.at(-1),(m.get(v.at(-1))||0)+1),m), new Map());
+    const winner = [...counts.entries()].sort((a,b) => b[1]-a[1])[0];
+    if (!winner || winner[1] / valid.length < .8) return;
+    for (const row of rows) {
+      const value = String(row[1] || '');
+      if (/^\d{13}$/.test(value)) row[1] = value + winner[0];
+      else if (/^\d{14}$/.test(value)) row[1] = value.slice(0,13) + winner[0];
     }
   }
 
