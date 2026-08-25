@@ -48,6 +48,11 @@ async function runExtraction() {
       throw new Error(`페이지 범위는 1~${pdf.numPages} 사이로 입력하세요.`);
     }
     STATE.pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
+    FendiExtractor.setFormDefaults({
+      owner: window.prompt('담당자명을 입력하세요. (입력한 값은 브라우저 밖으로 전송되지 않습니다.)', '') || '',
+      taxpayer: window.prompt('납세의무자(상호)를 입력하세요.', '') || '',
+      taxpayerId: window.prompt('납세의무자번호를 입력하세요. (숫자만)', '') || ''
+    });
     setProgress(3, 'OCR 준비', '한국어·영어 OCR 모델을 처음 한 번 내려받습니다.');
     worker = await Tesseract.createWorker(['kor', 'eng'], 1, {
       logger: m => {
