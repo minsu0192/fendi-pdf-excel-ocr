@@ -10,13 +10,6 @@
     '해외공급자상호', '최초수입신고번호', '미제출자료', '원본페이지', 'OCR검토필요'
   ];
   const X_BOUNDS = [0, .128, .195, .234, .298, .390, .570, .700, 1.01];
-  const FORM_DEFAULTS = { owner: '', taxpayer: '', taxpayerId: '' };
-
-  function setFormDefaults(values) {
-    for (const key of Object.keys(FORM_DEFAULTS)) {
-      FORM_DEFAULTS[key] = String(values?.[key] || '').trim();
-    }
-  }
 
   function normalizeNumeric(value) {
     const map = { O: '0', o: '0', I: '1', l: '1', '|': '1', S: '5', B: '8' };
@@ -27,6 +20,7 @@
     let text = String(value || '').replace(/\s+/g, ' ').replace(/^[ ,.;]+|[ ,.;]+$/g, '');
     if ([1, 2, 4, 6].includes(col)) return normalizeNumeric(text);
     if ([0, 3].includes(col)) text = text.replace(/([가-힣])\s+(?=[가-힣])/g, '$1');
+    if (col === 3) text = text.replace(/[\[{]/g, '(').replace(/[\]}|]/g, ')').replace(/\s*([()])\s*/g, '$1');
     if (col === 7) {
       text = text.replace(/미\s*제\s*출/g, '미제출').replace(/사\s*유\s*서/g, '사유서');
     }
@@ -78,12 +72,38 @@
     return /\d{10,}/.test(cells[1]) && /^20\d{6}$/.test(cells[2]);
   }
 
+  function isValidBusinessNumber(value) {
+    const text = String(value || '').replace(/\D/g, '');
+    if (!/^\d{10}$/.test(text)) return false;
+    const d = [...text].map(Number), weights = [1,3,7,1,3,7,1,3,5];
+    const sum = d.slice(0,9).reduce((s,v,i) => s + v * weights[i], 0) + Math.floor(d[8] * 5 / 10);
+    return (10 - sum % 10) % 10 === d[9];
+  }
+
+  function recoverBusinessNumber(value, current = '') {
+    const digits = String(value || '').replace(/\D/g, '');
+    const candidates = [];
+    if (digits.length === 10 && isValidBusinessNumber(digits)) candidates.push(digits);
+    if (digits.length === 11) {
+      for (let i = 0; i < digits.length; i++) {
+        const candidate = digits.slice(0,i) + digits.slice(i+1);
+        if (isValidBusinessNumber(candidate)) candidates.push(candidate);
+      }
+    }
+    const unique = [...new Set(candidates)];
+    return unique.sort((a,b) => editDistance(a, String(current || '')) - editDistance(b, String(current || '')))[0] || '';
+  }
+
   function reviewReasons(cells, confidences) {
     const reasons = [];
+    if (!/[가-힣]{2,}/.test(cells[0] || '')) reasons.push('담당자');
     if (!/^\d{13}[A-Z]$/.test(cells[1])) reasons.push('수입신고번호');
     if (!/^20\d{6}$/.test(cells[2])) reasons.push('수리일자');
-    if (cells[4] && !/^\d{10,13}$/.test(cells[4])) reasons.push('납세의무자번호');
-    if (confidences.some(v => v >= 0 && v < 45)) reasons.push('낮은 OCR 신뢰도');
+    if (!/[가-힣]{2,}/.test(cells[3] || '')) reasons.push('납세의무자');
+    if (!isValidBusinessNumber(cells[4])) reasons.push('납세의무자번호');
+    if (!/[A-Za-z가-힣]{3,}/.test(cells[5] || '')) reasons.push('해외공급자');
+    if (!/[가-힣A-Za-z]{3,}/.test(cells[7] || '')) reasons.push('미제출자료');
+    if ([1, 2, 4].some(i => confidences[i] >= 0 && confidences[i] < 35)) reasons.push('핵심값 낮은 신뢰도');
     return [...new Set(reasons)].join(', ');
   }
 
@@ -112,15 +132,11 @@
       });
       const cells = groups.map((g, i) => cleanCell(g.map(w => w.text).join(' '), i));
       if (!looksLikeDataRow(cells)) continue;
-      // These three values are invariant in the supplied FENDI Korea form and
-      // are too small in print for reliable OCR. Keep OCR for variable fields.
-      if (FORM_DEFAULTS.owner) cells[0] = FORM_DEFAULTS.owner;
-      if (FORM_DEFAULTS.taxpayer) cells[3] = FORM_DEFAULTS.taxpayer;
-      if (FORM_DEFAULTS.taxpayerId) cells[4] = normalizeNumeric(FORM_DEFAULTS.taxpayerId);
       cells[5] = normalizeSupplier(cells[5]);
       const confidences = groups.map(g => g.length ? g.reduce((s, w) => s + w.confidence, 0) / g.length : -1);
       const row = [...cells, pageNumber, reviewReasons(cells, confidences)];
       row._y = cluster.center;
+      row._confidences = confidences;
       rows.push(row);
     }
     return rows;
@@ -159,11 +175,130 @@
       if (best && distance <= maxDistance) {
         row[1] = best.declaration;
         row[2] = best.date;
-        row[9] = String(row[9] || '').split(', ').filter(x => !['수입신고번호','수리일자'].includes(x)).join(', ');
+        row._confidences[1] = Math.max(row._confidences[1], 70);
+        row._confidences[2] = Math.max(row._confidences[2], 70);
       }
     }
     return rows;
   }
 
-  return { HEADERS, X_BOUNDS, FORM_DEFAULTS, setFormDefaults, normalizeNumeric, cleanCell, normalizeSupplier, parseTsv, extractRows, extractKeyFields, applyKeyFields, reviewReasons };
+  function applyColumnWords(rows, words, imageHeight, col, rowCenters = null) {
+    const maxDistance = rowCenters ? Math.max(18, Math.floor(imageHeight / Math.max(1, rows.length) * .38)) : Math.max(15, Math.floor(imageHeight * .007));
+    const buckets = rows.map(() => []);
+    for (const word of words) {
+      const cy = word.top + word.height / 2;
+      let best = -1, distance = Infinity;
+      for (let i = 0; i < rows.length; i++) {
+        const targetY = rowCenters ? rowCenters[i] : (rows[i]._y || 0);
+        const d = Math.abs(targetY - cy);
+        if (d < distance) { best = i; distance = d; }
+      }
+      if (best >= 0 && distance <= maxDistance) buckets[best].push(word);
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const bucket = buckets[i].sort((a,b) => a.left - b.left);
+      if (!bucket.length) continue;
+      let value = cleanCell(bucket.map(w => w.text).join(' '), col);
+      if (col === 5) value = normalizeSupplier(value);
+      const confidence = bucket.reduce((s,w) => s + w.confidence, 0) / bucket.length;
+      rows[i]._columnCandidates = rows[i]._columnCandidates || {};
+      rows[i]._columnCandidates[col] = {value, confidence};
+      if (col === 4) value = recoverBusinessNumber(value, rows[i][4]) || value;
+      const plausible = col === 0 ? /[가-힣A-Za-z]{2,}/.test(value)
+        : col === 3 ? /[가-힣A-Za-z]{2,}/.test(value)
+        : col === 4 ? isValidBusinessNumber(value)
+        : col === 5 ? /[A-Za-z가-힣]{3,}/.test(value)
+        : col === 6 ? !value || /^\d{13}[A-Z]?-?$/.test(value)
+        : col === 7 ? /[가-힣A-Za-z]{3,}/.test(value)
+        : Boolean(value);
+      const current = String(rows[i][col] || '');
+      const currentPlausible = col === 0 ? /[가-힣A-Za-z]{2,}/.test(current)
+        : col === 3 ? /[가-힣A-Za-z]{2,}/.test(current)
+        : col === 4 ? isValidBusinessNumber(current)
+        : col === 5 ? /[A-Za-z가-힣]{3,}/.test(current)
+        : col === 6 ? !current || /^\d{13}[A-Z]?-?$/.test(current)
+        : col === 7 ? /[가-힣A-Za-z]{3,}/.test(current)
+        : Boolean(current);
+      // Short Korean names and ten-digit IDs are especially vulnerable to a
+      // one-character regression in isolated-column OCR. Use the second pass
+      // only to fill an implausible/missing value for those fields. Longer
+      // supplier and description fields benefit from the isolated crop.
+      const currentConfidence = rows[i]._confidences[col] || 0;
+      const replace = col === 0
+        ? (!currentPlausible || (/[가-힣]{2,}/.test(value) && (!/[가-힣]{2,}/.test(current) || confidence >= currentConfidence + 8)))
+        : col === 3
+        ? (!currentPlausible || (/[가-힣]{2,}/.test(value) && !/[가-힣]{2,}/.test(current)) || (value.length >= current.length + 2 && confidence >= currentConfidence - 8))
+        : col === 4
+        ? (!currentPlausible && plausible)
+        : (!currentPlausible || confidence >= (rows[i]._confidences[col] || 0) - 5);
+      if (plausible && replace && (confidence >= 20 || !current)) {
+        rows[i][col] = value;
+        rows[i]._confidences[col] = confidence;
+      }
+    }
+    return rows;
+  }
+
+  function finalizeRows(rows) {
+    for (const page of new Set(rows.map(r => r[8]))) {
+      const pageRows = rows.filter(r => r[8] === page);
+      applyLocalConsensus(pageRows, 0, 1);
+      applyLocalConsensus(pageRows, 3, 2);
+      applyBusinessConsensus(pageRows);
+    }
+    for (const row of rows) {
+      row[9] = [reviewReasons(row, row._confidences || []), ...(row._consensusReview || [])].filter(Boolean).join(', ');
+    }
+    const bestByKey = new Map();
+    for (const row of rows) {
+      const key = `${row[8]}|${row[1]}|${row[2]}`;
+      const score = row.slice(0, 8).filter(Boolean).length * 100 + (row._confidences || []).reduce((s,v) => s + Math.max(0,v), 0);
+      if (!bestByKey.has(key) || score > bestByKey.get(key).score) bestByKey.set(key, {row, score});
+    }
+    return [...bestByKey.values()].map(x => x.row);
+  }
+
+  function applyLocalConsensus(rows, col, maxEdits) {
+    const compact = value => String(value || '').replace(/[^0-9A-Za-z가-힣]/g, '').toUpperCase();
+    const votes = new Map();
+    for (const row of rows) {
+      for (const value of [row[col], row._columnCandidates?.[col]?.value]) {
+        const key = compact(value);
+        if (key.length >= 2) votes.set(key, {value: cleanCell(value, col), count: (votes.get(key)?.count || 0) + 1});
+      }
+    }
+    const winner = [...votes.values()].sort((a,b) => b.count - a.count)[0];
+    if (!winner || winner.count < Math.max(5, rows.length * .35)) return;
+    const winnerKey = compact(winner.value);
+    for (const row of rows) {
+      const currentKey = compact(row[col]);
+      const distance = editDistance(currentKey, winnerKey);
+      const confidence = row._confidences?.[col] || 0;
+      if (currentKey === winnerKey && cleanCell(row[col], col) !== winner.value) {
+        row[col] = winner.value;
+      } else if (currentKey !== winnerKey && distance <= maxEdits) {
+        row[col] = winner.value;
+        if (row._confidences) row._confidences[col] = Math.max(confidence, 80);
+      } else if (currentKey !== winnerKey && distance <= maxEdits + 2) {
+        row._consensusReview = row._consensusReview || [];
+        row._consensusReview.push(`${HEADERS[col]} OCR 불일치`);
+      }
+    }
+  }
+
+  function applyBusinessConsensus(rows) {
+    const valid = rows.map(r => String(r[4] || '')).filter(isValidBusinessNumber);
+    const counts = valid.reduce((m,v) => (m.set(v,(m.get(v)||0)+1),m), new Map());
+    const winner = [...counts.entries()].sort((a,b) => b[1]-a[1])[0];
+    if (!winner || winner[1] < Math.max(5, rows.length * .35)) return;
+    for (const row of rows) {
+      const current = String(row[4] || '');
+      if (!isValidBusinessNumber(current) && editDistance(current, winner[0]) <= 2) {
+        row[4] = winner[0];
+        if (row._confidences) row._confidences[4] = Math.max(row._confidences[4] || 0, 80);
+      }
+    }
+  }
+
+  return { HEADERS, X_BOUNDS, normalizeNumeric, cleanCell, normalizeSupplier, isValidBusinessNumber, recoverBusinessNumber, parseTsv, extractRows, extractKeyFields, applyKeyFields, applyColumnWords, finalizeRows, reviewReasons };
 });
